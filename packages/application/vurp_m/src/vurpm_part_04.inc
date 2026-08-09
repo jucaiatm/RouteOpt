@@ -267,6 +267,11 @@ void BpcSolver::solve() {
             if (!fixingSetContradictory(one_child.fixings)) queue.push(std::move(one_child));
             node_finished = true;
         }
+
+        if (timeLimitReached() && !node_finished) {
+            queue.push(std::move(node));
+            break;
+        }
     }
 
     statistics_.elapsed = elapsed();
