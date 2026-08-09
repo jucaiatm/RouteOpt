@@ -83,7 +83,10 @@ void MasterProblem::buildBaseRows() {
             phase_one_rows_.emplace_back(rows_.first_link[pos], "first_link_" + std::to_string(pos));
             phase_one_rows_.emplace_back(rows_.last_link[pos], "last_link_" + std::to_string(pos));
         }
-        rows_.length_link[k] = addConstraint({{layout_.ell[k], 1.0}}, GRB_EQUAL, 0.0,
+        // The inequality is equivalent at an optimum because ell only makes the
+        // duration constraints harder.  Its nonnegative dual is essential for
+        // exact shortest-Hamilton-path pricing.
+        rows_.length_link[k] = addConstraint({{layout_.ell[k], 1.0}}, GRB_GREATER_EQUAL, 0.0,
                                              "length_link_" + std::to_string(k));
 
         addConstraint({{layout_.alpha[k], 1.0}, {layout_.ell[k], 1.0}, {layout_.beta[k], 1.0},
