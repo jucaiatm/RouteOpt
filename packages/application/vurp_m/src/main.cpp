@@ -22,6 +22,24 @@ void printUsage(const char *program) {
               << "  --verbose-socp\n";
 }
 
+void validateParameters(const BpcParameters &parameters) {
+    if (parameters.time_limit <= 0.0) {
+        throw std::runtime_error("--time-limit must be positive");
+    }
+    if (parameters.threads <= 0) {
+        throw std::runtime_error("--threads must be positive");
+    }
+    if (parameters.max_pricing_columns_per_slot <= 0) {
+        throw std::runtime_error("--pricing-columns must be positive for exact column generation");
+    }
+    if (parameters.max_oa_cuts_per_round <= 0) {
+        throw std::runtime_error("--oa-cuts must be positive for exact conic outer approximation");
+    }
+    if (parameters.max_exact_pricing_customers <= 0) {
+        throw std::runtime_error("--max-exact-customers must be positive");
+    }
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -61,7 +79,13 @@ int main(int argc, char **argv) {
             }
         }
 
+        validateParameters(parameters);
         Instance instance = Instance::read(instance_path);
+        if (instance.n > parameters.max_exact_pricing_customers) {
+            throw std::runtime_error(
+                "DIMENSION exceeds --max-exact-customers; increase the exact-pricing limit explicitly");
+        }
+
         BpcSolver solver(std::move(instance), parameters);
         solver.solve();
         solver.printResult();
