@@ -16,6 +16,9 @@ MISOCP/LBBD manuscript:
 - the objective is the elapsed time from vessel departure until the vessel and
   UAV return to the depot.
 
+The new application is isolated under `packages/application/vurp_m`; the
+existing CVRP and VRPTW applications are not modified.
+
 ## Column definition
 
 A generated column is one complete **ordered UAV sortie path**
@@ -51,12 +54,16 @@ The executable implements the following loop at every branch-and-bound node:
 The internal-length linking row is oriented as
 
 ```math
-\ell_k - \sum_r h_r\lambda_{kr}=0,
+\ell_k - \sum_r h_r\lambda_{kr} \ge 0.
 ```
 
-which makes its pricing dual nonnegative. Therefore, for a fixed visited set,
-first platform, and last platform, the shortest Hamilton path is the only path
-that can minimize reduced cost. This permits exact Held--Karp-style pricing.
+This inequality is equivalent to equality at an optimum: increasing
+`ell[k]` can only tighten the UAV-duration constraint and cannot improve the
+minimization objective. The greater-than row has a nonnegative dual in the
+minimization master. Consequently, for a fixed visited set, first platform,
+and last platform, the shortest Hamilton path is the only path that can
+minimize reduced cost. This establishes the correctness of the
+Held--Karp-style exact pricing routine.
 
 The static incompatibility rule from the VURP-M model is applied during both
 master construction and pricing:
@@ -67,17 +74,21 @@ master construction and pricing:
 \text{platforms }i,j\text{ cannot share a sortie}.
 ```
 
-## Current supported model
+## Exactness scope
 
-The continuous region `OMEGA` is represented by an axis-aligned rectangle.
-When `OMEGA` is omitted, a conservative rectangle containing the depot and all
-platforms is generated automatically. Platform service times and payload
-capacities are not included because they are not present in the referenced
-VURP-M total-time formulation.
+The solver is exact, up to the configured numerical tolerances, for the model
+implemented here:
+
+- `OMEGA` is an axis-aligned rectangle;
+- platform service times and UAV payload constraints are absent, matching the
+  referenced total-time formulation;
+- exact subset pricing is used for every processed branch-and-bound node;
+- an integer solution is accepted only after the fixed-partition convex SOCP
+  has certified it.
 
 Exact subset pricing is enabled up to 20 platforms by default. This is a
 memory guard, not a relaxation. Raising `--max-exact-customers` preserves
-exactness but requires exponentially more memory.
+exactness but requires exponentially more memory and time.
 
 ## Instance format
 
@@ -116,6 +127,12 @@ The executable is written to:
 
 ```text
 packages/application/vurp_m/bin/vurp_m_bpc
+```
+
+A convenience wrapper is also provided:
+
+```bash
+python3 packages/application/vurp_m/build.py
 ```
 
 ## Run
