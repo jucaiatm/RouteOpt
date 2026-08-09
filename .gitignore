@@ -23,3 +23,7 @@
 /packages/external/**/*.dll
 /packages/external/**/*.lib
 /packages/external/**/*.d
+
+# VURP-M application build outputs
+/packages/application/vurp_m/build/
+/packages/application/vurp_m/bin/
