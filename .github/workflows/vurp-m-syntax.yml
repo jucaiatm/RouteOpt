@@ -1,0 +1,33 @@
+name: VURP-M syntax check
+
+on:
+  push:
+    paths:
+      - "packages/application/vurp_m/**"
+      - ".github/workflows/vurp-m-syntax.yml"
+  pull_request:
+    paths:
+      - "packages/application/vurp_m/**"
+      - ".github/workflows/vurp-m-syntax.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Compile VURP-M sources in syntax-only mode
+        shell: bash
+        run: |
+          g++ \
+            -std=c++20 \
+            -Wall -Wextra -Wpedantic \
+            -I packages/application/vurp_m/tests/gurobi_stub \
+            -I packages/application/vurp_m/src \
+            -fsyntax-only \
+            packages/application/vurp_m/src/main.cpp \
+            packages/application/vurp_m/src/vurpm.cpp
