@@ -1,0 +1,278 @@
+diff --git a/packages/application/vurp_m/PERFORMANCE.md b/packages/application/vurp_m/PERFORMANCE.md
+index ff43d5d..20ac827 100644
+--- a/packages/application/vurp_m/PERFORMANCE.md
++++ b/packages/application/vurp_m/PERFORMANCE.md
+@@ -204,3 +204,22 @@ continuous recourse:
+ 
+ They require separate VURP-M coefficient, state, and validation layers. The
+ current performance suite is exact without them.
++
++
++## P0 OA hotfix after Example9_1
++
++Fractional-node SOC outer approximation is now budgeted rather than closed to
++full convergence at every branch-and-bound node. Root nodes use
++`ROOT_OA_ROUND_LIMIT` rounds (default 6), non-root nodes use
++`NODE_OA_ROUND_LIMIT` rounds (default 1), and each round adds at most
++`MAX_OA_CUTS_PER_ROUND` tangents (default 24). Node tangents are inherited only
++along the current branch; only initial and certified-SOCP tangents are shared
++across sibling nodes. This preserves exactness because all fractional masters
++remain valid relaxations and every integer partition is certified by the exact
++SOCP oracle.
++
++Fixed sortie counts are processed starting from the certified incumbent's
++sortie count, then neighbouring counts, unless
++`PRIORITIZE_INCUMBENT_SORTIE_COUNT false` or `--ascending-sortie-order` is used.
++The initial heuristic also reserves at least one SOCP candidate for each sortie
++count before using the remaining candidate budget.
+diff --git a/packages/application/vurp_m/src/bpc_solver.cpp b/packages/application/vurp_m/src/bpc_solver.cpp
+index 40e5c49..7178836 100644
+--- a/packages/application/vurp_m/src/bpc_solver.cpp
++++ b/packages/application/vurp_m/src/bpc_solver.cpp
+@@ -265,6 +265,7 @@ std::vector<RoutePattern> BPCSolver::splitTourDP(const std::vector<int> &tour, i
+ 
+ void BPCSolver::constructInitialIncumbent() {
+     struct Candidate {
++        int sorties{};
+         double proxy{};
+         std::vector<RoutePattern> routes;
+     };
+@@ -280,17 +281,43 @@ void BPCSolver::constructInitialIncumbent() {
+             if (routes.empty()) continue;
+             const std::string key = routeSetKey(routes);
+             if (!seen.insert(key).second) continue;
+-            candidates.push_back({proxy, std::move(routes)});
++            candidates.push_back({m, proxy, std::move(routes)});
+         }
+     }
+ 
+     std::sort(candidates.begin(), candidates.end(),
+               [](const Candidate &a, const Candidate &b) { return a.proxy < b.proxy; });
+-    if (static_cast<int>(candidates.size()) > instance_.config.max_initial_socp_calls) {
+-        candidates.resize(static_cast<std::size_t>(instance_.config.max_initial_socp_calls));
+-    }
+ 
++    // Preserve at least the best available candidate for every feasible sortie
++    // count before filling the remaining SOCP-call budget. This prevents a
++    // single, usually large, sortie count from monopolising the initial UB
++    // search merely because its geometric proxy is optimistic.
++    std::vector<Candidate> selected;
++    std::unordered_set<std::string> selected_keys;
++    for (int m = instance_.config.min_sorties;
++         m <= instance_.config.max_sorties; ++m) {
++        const auto it = std::find_if(candidates.begin(), candidates.end(),
++                                     [m](const Candidate &candidate) {
++                                         return candidate.sorties == m;
++                                     });
++        if (it == candidates.end()) continue;
++        const std::string key = routeSetKey(it->routes);
++        if (selected_keys.insert(key).second) selected.push_back(*it);
++    }
+     for (const Candidate &candidate : candidates) {
++        if (static_cast<int>(selected.size()) >=
++            instance_.config.max_initial_socp_calls) {
++            break;
++        }
++        const std::string key = routeSetKey(candidate.routes);
++        if (selected_keys.insert(key).second) selected.push_back(candidate);
++    }
++    if (static_cast<int>(selected.size()) > instance_.config.max_initial_socp_calls) {
++        selected.resize(static_cast<std::size_t>(
++            instance_.config.max_initial_socp_calls));
++    }
++
++    for (const Candidate &candidate : selected) {
+         if (timeExpired()) return;
+         ++statistics_.primal_heuristic_candidates;
+         ++statistics_.socp_calls;
+@@ -494,9 +521,13 @@ MasterSolution BPCSolver::runColumnGeneration(Node &node,
+         phase_one ? node.phase_one_dual_centre : node.phase_two_dual_centre;
+ 
+     while (!timeExpired()) {
++        std::vector<OACut> active_oa_cuts = state.oa_cuts;
++        active_oa_cuts.insert(active_oa_cuts.end(),
++                              node.local_oa_cuts.begin(),
++                              node.local_oa_cuts.end());
+         MasterProblem master(environment_, instance_, state.sorties, route_pool_,
+                              state.active_pattern_ids, node.fixes,
+-                             state.oa_cuts, state.logic_cuts,
++                             active_oa_cuts, state.logic_cuts,
+                              state.subset_row_cuts, phase_one, remaining());
+         ++statistics_.master_lp_solves;
+         MasterSolution solution = master.solve();
+@@ -801,9 +832,31 @@ bool BPCSolver::solveFixedSorties(int sorties) {
+                 break;
+             }
+ 
+-            const int added_oa = oa_separator.separate(relaxation, state.oa_cuts);
+-            statistics_.oa_cuts_generated += static_cast<std::uint64_t>(added_oa);
+-            if (added_oa > 0) continue;
++            // Fractional-node OA is deliberately budgeted. The current LP is
++            // always a valid relaxation, so branching before complete SOC
++            // closure preserves exactness; integer partitions are closed by
++            // the exact SOCP oracle and a logic-based value/no-good cut.
++            const int oa_round_limit = node.depth == 0
++                                           ? instance_.config.root_oa_round_limit
++                                           : instance_.config.node_oa_round_limit;
++            if (node.oa_rounds < oa_round_limit) {
++                std::vector<OACut> candidate_cuts = state.oa_cuts;
++                candidate_cuts.insert(candidate_cuts.end(),
++                                      node.local_oa_cuts.begin(),
++                                      node.local_oa_cuts.end());
++                const std::size_t old_size = candidate_cuts.size();
++                const int added_oa = oa_separator.separate(relaxation, candidate_cuts);
++                if (added_oa > 0) {
++                    node.local_oa_cuts.insert(node.local_oa_cuts.end(),
++                                              candidate_cuts.begin() +
++                                                  static_cast<std::ptrdiff_t>(old_size),
++                                              candidate_cuts.end());
++                    statistics_.oa_cuts_generated +=
++                        static_cast<std::uint64_t>(added_oa);
++                    ++node.oa_rounds;
++                    continue;
++                }
++            }
+ 
+             const int added_subset = subset_separator.separate(
+                 relaxation, route_pool_, state.subset_row_cuts,
+@@ -825,6 +878,8 @@ bool BPCSolver::solveFixedSorties(int sorties) {
+                     child.fixes = node.fixes;
+                     child.phase_one_dual_centre = node.phase_one_dual_centre;
+                     child.phase_two_dual_centre = node.phase_two_dual_centre;
++                    child.local_oa_cuts = node.local_oa_cuts;
++                    child.oa_rounds = 0;
+                     if (applyDecision(child.fixes, branch_candidate, value)) {
+                         queue.push(std::move(child));
+                     }
+@@ -913,9 +968,24 @@ SolveResult BPCSolver::solve() {
+ 
+     constructInitialIncumbent();
+ 
+-    bool all_completed = true;
++    std::vector<int> sortie_order;
+     for (int m = instance_.config.min_sorties;
+          m <= instance_.config.max_sorties; ++m) {
++        sortie_order.push_back(m);
++    }
++    if (instance_.config.prioritize_incumbent_sortie_count && incumbent_.feasible) {
++        const int incumbent_sorties = incumbent_.sorties;
++        std::stable_sort(sortie_order.begin(), sortie_order.end(),
++                         [incumbent_sorties](int lhs, int rhs) {
++                             const int dl = std::abs(lhs - incumbent_sorties);
++                             const int dr = std::abs(rhs - incumbent_sorties);
++                             if (dl != dr) return dl < dr;
++                             return lhs > rhs;
++                         });
++    }
++
++    bool all_completed = true;
++    for (const int m : sortie_order) {
+         if (timeExpired() || !solveFixedSorties(m)) {
+             all_completed = false;
+             break;
+diff --git a/packages/application/vurp_m/src/include/bpc_solver.hpp b/packages/application/vurp_m/src/include/bpc_solver.hpp
+index f73ca69..8b37053 100644
+--- a/packages/application/vurp_m/src/include/bpc_solver.hpp
++++ b/packages/application/vurp_m/src/include/bpc_solver.hpp
+@@ -44,6 +44,11 @@ private:
+         BranchFixes fixes;
+         std::vector<PricingDuals> phase_one_dual_centre;
+         std::vector<PricingDuals> phase_two_dual_centre;
++        // Valid OA tangents inherited only along this branch. They are not
++        // inserted into the global fixed-sortie pool, which prevents sibling
++        // nodes from repeatedly rebuilding thousands of irrelevant rows.
++        std::vector<OACut> local_oa_cuts;
++        int oa_rounds{};
+     };
+ 
+     struct NodeCompare {
+diff --git a/packages/application/vurp_m/src/include/vurpm_types.hpp b/packages/application/vurp_m/src/include/vurpm_types.hpp
+index 6a8ed23..bf5da52 100644
+--- a/packages/application/vurp_m/src/include/vurpm_types.hpp
++++ b/packages/application/vurp_m/src/include/vurpm_types.hpp
+@@ -56,7 +56,13 @@ struct SolverConfig {
+     int min_sorties{1};
+     int max_sorties{-1};
+     int max_columns_per_pricing{20};
+-    int max_oa_cuts_per_round{200};
++    // Fractional-node OA is a bounded strengthening procedure. Full SOC
++    // closure is not required for correctness because every integer partition
++    // is certified by the exact SOCP oracle.
++    int max_oa_cuts_per_round{24};
++    int root_oa_round_limit{6};
++    int node_oa_round_limit{1};
++    bool prioritize_incumbent_sortie_count{true};
+ 
+     // Pricing acceleration.
+     int pricing_threads{1};
+diff --git a/packages/application/vurp_m/src/instance.cpp b/packages/application/vurp_m/src/instance.cpp
+index b7cbc74..eae1b72 100644
+--- a/packages/application/vurp_m/src/instance.cpp
++++ b/packages/application/vurp_m/src/instance.cpp
+@@ -191,7 +191,8 @@ void Instance::finalise() {
+     }
+     if (!(config.time_limit > 0.0) || config.threads < 1 ||
+         config.pricing_threads < 1 || config.max_columns_per_pricing < 1 ||
+-        config.max_oa_cuts_per_round < 1 || config.heuristic_beam_width < 1 ||
++        config.max_oa_cuts_per_round < 1 || config.root_oa_round_limit < 0 ||
++        config.node_oa_round_limit < 0 || config.heuristic_beam_width < 1 ||
+         config.heuristic_label_limit < 1 || config.enumeration_customer_limit < 1 ||
+         config.max_enumerated_routes < 1 || config.max_pool_columns_per_round < 1 ||
+         config.max_subset_row_cuts_per_round < 1 || config.initial_heuristic_tours < 1 ||
+@@ -418,6 +419,15 @@ Instance InstanceReader::read(const std::string &path) {
+         } else if (key == "MAX_OA_CUTS_PER_ROUND") {
+             require(2);
+             instance.config.max_oa_cuts_per_round = parseInt(fields[1], key);
++        } else if (key == "ROOT_OA_ROUND_LIMIT") {
++            require(2);
++            instance.config.root_oa_round_limit = parseInt(fields[1], key);
++        } else if (key == "NODE_OA_ROUND_LIMIT") {
++            require(2);
++            instance.config.node_oa_round_limit = parseInt(fields[1], key);
++        } else if (key == "PRIORITIZE_INCUMBENT_SORTIE_COUNT") {
++            require(2);
++            instance.config.prioritize_incumbent_sortie_count = parseBool(fields[1]);
+         } else if (key == "HEURISTIC_PRICING") {
+             require(2);
+             instance.config.enable_heuristic_pricing = parseBool(fields[1]);
+diff --git a/packages/application/vurp_m/src/main.cpp b/packages/application/vurp_m/src/main.cpp
+index 535873a..91aa927 100644
+--- a/packages/application/vurp_m/src/main.cpp
++++ b/packages/application/vurp_m/src/main.cpp
+@@ -27,6 +27,10 @@ void printUsage(const char *program) {
+         << "  --min-sorties N\n"
+         << "  --max-sorties N\n"
+         << "  --max-columns N\n"
++        << "  --oa-cuts N\n"
++        << "  --root-oa-rounds N\n"
++        << "  --node-oa-rounds N\n"
++        << "  --ascending-sortie-order\n"
+         << "  --beam-width N\n"
+         << "  --heuristic-label-limit N\n"
+         << "  --stabilization-alpha A\n"
+@@ -139,6 +143,14 @@ int main(int argc, char **argv) {
+                 instance.config.max_sorties = std::stoi(requireValue());
+             } else if (option == "--max-columns") {
+                 instance.config.max_columns_per_pricing = std::stoi(requireValue());
++            } else if (option == "--oa-cuts") {
++                instance.config.max_oa_cuts_per_round = std::stoi(requireValue());
++            } else if (option == "--root-oa-rounds") {
++                instance.config.root_oa_round_limit = std::stoi(requireValue());
++            } else if (option == "--node-oa-rounds") {
++                instance.config.node_oa_round_limit = std::stoi(requireValue());
++            } else if (option == "--ascending-sortie-order") {
++                instance.config.prioritize_incumbent_sortie_count = false;
+             } else if (option == "--beam-width") {
+                 instance.config.heuristic_beam_width = std::stoi(requireValue());
+diff --git a/packages/application/vurp_m/src/master.cpp b/packages/application/vurp_m/src/master.cpp
+index 66228a2..e9b2270 100644
+--- a/packages/application/vurp_m/src/master.cpp
++++ b/packages/application/vurp_m/src/master.cpp
+@@ -693,7 +693,7 @@ bool OASeparator::duplicate(const std::vector<OACut> &cuts, const OACut &candidat
+     for (const OACut &cut : cuts) {
+         if (cut.type != candidate.type || cut.slot != candidate.slot) continue;
+-        if (dot(cut.direction, candidate.direction) >= 1.0 - 1e-10) return true;
++        if (dot(cut.direction, candidate.direction) >= 1.0 - 1e-8) return true;
+     }
+     return false;
+ }
